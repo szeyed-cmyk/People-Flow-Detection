@@ -1,1 +1,155 @@
+!pip install ultralytics opencv-python-headless tqdm -q
 
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from tqdm import tqdm
+import os
+from IPython.display import Image, display
+
+# mount google drive in colab  # mount = connect
+from google.colab import drive
+drive.mount('/content/drive')
+
+VIDEO_PATH = "/content/drive/MyDrive/Assignment-16/people-walking.mp4"
+OUTPUT_VIDEO = "/content/drive/MyDrive/Assignment-16/people_flow_output.mp4"
+FINAL_HEATMAP = "/content/drive/MyDrive/Assignment-16/final_heatmap.jpg"
+MODEL_NAME = "yolov8n.pt"  # nano for speed; use yolov8s or larger for better accuracy
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from tqdm import tqdm
+import os
+from IPython.display import Image, Video, display
+
+# ---------------- Configuration ----------------
+VIDEO_PATH = "people-walking.mp4"
+OUTPUT_VIDEO = "people_flow_output.mp4"
+FINAL_HEATMAP = "final_heatmap.jpg"
+MODEL_NAME = "yolov8n.pt"
+
+UPPER_LINE_FRAC = 0.40
+LOWER_LINE_FRAC = 0.60
+FADE_ALPHA = 0.97          # slower fade = stronger trails
+HEATMAP_RADIUS = 12
+
+# Download sample video if needed
+if not os.path.exists(VIDEO_PATH):
+    print("Downloading sample video...")
+    os.system("wget -q https://media.roboflow.com/supervision/video-examples/people-walking.mp4 -O people-walking.mp4")
+
+print("Loading model...")
+model = YOLO(MODEL_NAME)
+
+cap = cv2.VideoCapture(VIDEO_PATH)
+fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+top_y = int(height * UPPER_LINE_FRAC)
+bottom_y = int(height * LOWER_LINE_FRAC)
+
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+out = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps, (width, height))
+
+id_positions = {}
+id_states = {}
+in_count = 0
+out_count = 0
+
+# Heatmap canvas (float for accumulation)
+heatmap_canvas = np.zeros((height, width), dtype=np.float32)
+
+print("Processing video...")
+for i in tqdm(range(frame_count)):
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    results = model.track(frame, classes=[0], persist=True, verbose=False, conf=0.3, iou=0.5)
+
+    boxes = results[0].boxes.xyxy.cpu().numpy() if results[0].boxes is not None else []
+    track_ids = results[0].boxes.id.int().cpu().tolist() if results[0].boxes is not None and results[0].boxes.id is not None else []
+
+    current_ids = set()
+
+    # Draw counting lines
+    cv2.line(frame, (0, top_y), (width, top_y), (255, 0, 0), 3)
+    cv2.line(frame, (0, bottom_y), (width, bottom_y), (0, 0, 255), 3)
+
+    for box, track_id in zip(boxes, track_ids):
+        x1, y1, x2, y2 = map(int, box)
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        current_ids.add(track_id)
+
+        # Counting logic
+        if track_id in id_positions:
+            prev_y = id_positions[track_id]
+            if prev_y < top_y and cy >= top_y and id_states.get(track_id) != "in":
+                in_count += 1
+                id_states[track_id] = "in"
+            elif prev_y > bottom_y and cy <= bottom_y and id_states.get(track_id) != "out":
+                out_count += 1
+                id_states[track_id] = "out"
+
+        id_positions[track_id] = cy
+
+        # Color by state
+        color = (255, 255, 255)
+        if id_states.get(track_id) == "in":
+            color = (0, 255, 0)
+        elif id_states.get(track_id) == "out":
+            color = (0, 0, 255)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(frame, f"ID:{track_id}", (x1, max(y1 - 10, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.circle(frame, (cx, cy), 4, color, -1)
+
+        # ---- Heatmap: accumulate presence at bounding box center ----
+        cv2.circle(heatmap_canvas, (cx, cy), HEATMAP_RADIUS, 2.0, -1)
+
+    # Remove lost tracks
+    lost_ids = set(id_positions.keys()) - current_ids
+    for lost_id in lost_ids:
+        id_positions.pop(lost_id, None)
+        id_states.pop(lost_id, None)
+
+    # Fade heatmap slightly
+    heatmap_canvas *= FADE_ALPHA
+
+    # Create live heatmap overlay
+    temp = np.clip(heatmap_canvas, 0, 255)
+    temp = cv2.GaussianBlur(temp, (31, 31), 0)
+    heatmap_color = cv2.applyColorMap(temp.astype(np.uint8), cv2.COLORMAP_JET)
+    overlay = cv2.addWeighted(frame, 0.60, heatmap_color, 0.40, 0)
+
+    # Counters
+    cv2.putText(overlay, f"IN: {in_count}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+    cv2.putText(overlay, f"OUT: {out_count}", (30, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+    cv2.putText(overlay, f"Active: {len(current_ids)}", (30, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 2)
+
+    out.write(overlay)
+
+cap.release()
+out.release()
+
+# ===================== Final Heatmap (separate image) =====================
+final_heat = np.clip(heatmap_canvas * 20, 0, 255)   # amplify for visibility
+final_heat = cv2.GaussianBlur(final_heat.astype(np.uint8), (51, 51), 0)
+final_colored = cv2.applyColorMap(final_heat, cv2.COLORMAP_JET)
+cv2.imwrite(FINAL_HEATMAP, final_colored)
+
+print(f"\nDone → IN: {in_count} | OUT: {out_count}")
+print(f"Saved: {OUTPUT_VIDEO} and {FINAL_HEATMAP}")
+
+# Display final heatmap
+print("\nFinal Heatmap (areas of highest presence/movement):")
+display(Image(FINAL_HEATMAP))
+
+# Display output video
+print("\nOutput Video:")
+display(Video(OUTPUT_VIDEO, embed=True, width=960, height=540))
